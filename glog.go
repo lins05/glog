@@ -81,6 +81,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -805,6 +806,7 @@ type syncBuffer struct {
 	file   *os.File
 	sev    severity
 	nbytes uint64 // The number of bytes written to this file
+	today  byte   // The second byte of current day
 }
 
 func (sb *syncBuffer) Sync() error {
@@ -812,6 +814,14 @@ func (sb *syncBuffer) Sync() error {
 }
 
 func (sb *syncBuffer) Write(p []byte) (n int, err error) {
+	if DailyRolling {
+		// Lmmdd hh:mm:ss.uuuuuu threadid file:line]
+		if sb.today != p[4] {
+			if err := sb.rotateFile(time.Now()); err != nil {
+				sb.logger.exit(err)
+			}
+		}
+	}
 	if sb.nbytes+uint64(len(p)) >= MaxSize {
 		if err := sb.rotateFile(time.Now()); err != nil {
 			sb.logger.exit(err)
@@ -830,6 +840,31 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 	if sb.file != nil {
 		sb.Flush()
 		sb.file.Close()
+		if DailyRolling && sb.file.Name() != os.DevNull {
+			fname := sb.file.Name()
+			if sb.today == digits[now.Day()%10] {
+				// rotate by MaxSize, avoid overwrite
+				newpath := filepath.Join(filepath.Dir(fname), program+now.Format(".log.20060102T150405"))
+				os.Rename(fname, newpath)
+			}
+			if files, _ := filepath.Glob(fname[:strings.LastIndex(fname, ".")] + ".*"); len(files) > Backups {
+				sort.Slice(files, func(i, j int) bool {
+					a, b := files[i], files[j]
+					n := len(a)
+					if len(b) < n {
+						n = len(b)
+					}
+					if r := strings.Compare(a[:n], b[:n]); r != 0 {
+						return r < 0
+					} else {
+						return strings.Compare(a, b) > 0
+					}
+				})
+				for i := 0; i < len(files)-Backups; i++ {
+					os.Remove(files[i])
+				}
+			}
+		}
 	}
 	var err error
 	sb.file, _, err = create(severityName[sb.sev], now)
@@ -839,6 +874,15 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 	}
 
 	sb.Writer = bufio.NewWriterSize(sb.file, bufferSize)
+
+	if DailyRolling {
+		sb.today = digits[now.Day()%10]
+		if fi, _ := sb.file.Stat(); fi != nil {
+			sb.nbytes = uint64(fi.Size())
+		}
+		// skip header if daily rolling
+		return nil
+	}
 
 	// Write header.
 	var buf bytes.Buffer
